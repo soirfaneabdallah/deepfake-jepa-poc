@@ -1,0 +1,88 @@
+# ============================================
+# Configuration des données vidéo pour v-JEPA
+# ============================================
+
+data:
+  # Dataset vidéo
+  video:
+    format: "mp4"  # mp4, avi
+    fps: 30
+    min_duration: 2  # secondes minimum
+    max_duration: 10  # secondes maximum
+    
+    # FaceForensics++ vidéos
+    faceforensics:
+      root: "./data/raw/FaceForensics++"
+      real_videos: "original_sequences/youtube/c23/videos"
+      fake_videos:
+        deepfakes: "manipulated_sequences/DeepFakes/c23/videos"
+        face2face: "manipulated_sequences/Face2Face/c23/videos"
+        faceswap: "manipulated_sequences/FaceSwap/c23/videos"
+        neuraltextures: "manipulated_sequences/NeuralTextures/c23/videos"
+      
+      # Métadonnées
+      metadata:
+        compression: "c23"  # c0, c23, c40
+        resolution: "1080p"
+        total_videos: 1000
+        videos_per_generator: 200
+        
+  # Extraction de frames
+  frame_extraction:
+    method: "ffmpeg"  # ffmpeg, opencv, decord
+    num_frames: 16
+    target_fps: 10
+    resize: [224, 224]
+    
+    # Détection et alignement des visages
+    face_detection:
+      enabled: true
+      detector: "mtcnn"  # mtcnn, retinaface, mediapipe
+      margin: 20
+      min_face_size: 100
+      align_eyes: true
+      track_faces: true  # Suivi temporel des visages
+    
+  # Prétraitement vidéo
+  preprocessing:
+    normalize: true
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+    
+    # Augmentations vidéo spécifiques
+    augmentation:
+      temporal_sampling: "uniform"
+      spatial_augmentation: true
+      temporal_augmentation: true
+      
+  # Gestion des splits
+  splits:
+    train_ratio: 0.7
+    val_ratio: 0.15
+    test_ratio: 0.15
+    
+    # Split par vidéo (pas par frame) pour éviter les fuites
+    split_by: "video"
+    stratify_by_generator: true
+    
+  # Sous-échantillonnage pour PoC
+  subsampling:
+    enabled: true
+    max_videos_per_class: 100
+    max_frames_per_video: 16
+    balance_generators: true
+    
+  # Tâches d'apprentissage continu
+  continual_tasks:
+    - name: "DeepFakes"
+      videos_path: "manipulated_sequences/DeepFakes/c23/videos"
+      num_videos: 200
+    - name: "Face2Face"
+      videos_path: "manipulated_sequences/Face2Face/c23/videos"
+      num_videos: 200
+    - name: "FaceSwap"
+      videos_path: "manipulated_sequences/FaceSwap/c23/videos"
+      num_videos: 200
+    - name: "NeuralTextures"
+      videos_path: "manipulated_sequences/NeuralTextures/c23/videos"
+      num_videos: 200

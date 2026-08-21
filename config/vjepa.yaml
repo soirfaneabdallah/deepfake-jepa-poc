@@ -1,0 +1,142 @@
+# ============================================
+# Configuration v-JEPA pour la détection de deepfakes
+# Basée sur l'architecture Video JEPA de Meta AI
+# ============================================
+
+vjepa:
+  # Architecture
+  architecture:
+    # Encodeur vidéo (spatio-temporel)
+    encoder:
+      type: "video_vit"  # video_vit, video_swin, slowfast
+      input_size: [224, 224]  # Hauteur, Largeur
+      patch_size: [16, 16]  # Patch spatial
+      tubelet_size: 2  # Frames par tubelet
+      num_frames: 16  # Frames par clip
+      
+      # Dimensions
+      embed_dim: 768
+      depth: 12
+      num_heads: 12
+      mlp_ratio: 4.0
+      dropout: 0.1
+      
+      # Initialisation
+      pretrained: false  # v-JEPA n'utilise pas de pré-entraînement ImageNet
+      use_flash_attention: true
+      
+    # Encodeur cible (EMA)
+    target_encoder:
+      ema_decay: 0.998
+      ema_end_decay: 0.9998
+      update_after_step: 0
+      use_same_weights: false
+      
+    # Prédicteur latent
+    predictor:
+      num_layers: 4
+      hidden_dim: 384
+      num_heads: 6
+      dropout: 0.1
+      
+  # Masquage spatio-temporel
+  masking:
+    strategy: "block"  # block, random, tube
+    spatial_mask_ratio: 0.75  # 75% des patches masqués
+    temporal_mask_ratio: 0.9  # 90% des frames masquées
+    mask_tube_length: 2  # Masquage en tubes temporels
+    min_keep: 1  # Garder au moins 1 frame visible
+    
+  # Échantillonnage des frames
+  frame_sampling:
+    num_frames: 16
+    sampling_strategy: "uniform"  # uniform, random, stride
+    stride: 2
+    temporal_jitter: true
+    
+  # Projections
+  projections:
+    output_dim: 512
+    hidden_dim: 1024
+    num_layers: 2
+    bottleneck_dim: 256
+    use_batch_norm: true
+    
+  # Perte
+  loss:
+    type: "smooth_l1"  # smooth_l1, cosine, mse
+    temperature: 0.1
+    use_vicreg: false
+    variance_epsilon: 0.0001
+    covariance_epsilon: 0.0001
+    
+  # Optimisation
+  optimizer:
+    type: "adamw"
+    learning_rate: 0.0001
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+    eps: 1e-8
+    gradient_clip: 1.0
+    
+  # Scheduler
+  scheduler:
+    type: "cosine_warmup"
+    warmup_epochs: 10
+    min_lr: 0.000001
+    total_epochs: 300
+    
+  # Entraînement
+  training:
+    epochs: 300
+    batch_size: 8  # v-JEPA nécessite beaucoup de mémoire
+    gradient_accumulation_steps: 4
+    mixed_precision: true
+    use_amp: true
+    
+    # EMA du prédicteur
+    predictor_ema:
+      enabled: true
+      decay: 0.999
+      
+    # Validation
+    validation_frequency: 5
+    save_checkpoint_frequency: 10
+    
+  # Augmentations spatio-temporelles
+  augmentations:
+    spatial:
+      random_resized_crop:
+        scale: [0.3, 1.0]
+        ratio: [0.75, 1.33]
+      horizontal_flip: true
+      color_jitter:
+        brightness: 0.4
+        contrast: 0.4
+        saturation: 0.4
+        hue: 0.1
+      gaussian_blur:
+        probability: 0.5
+        sigma: [0.1, 2.0]
+      solarization:
+        probability: 0.2
+        
+    temporal:
+      frame_dropout: 0.1
+      temporal_crop: true
+      reverse_playback: 0.1
+      speed_perturbation: [0.5, 2.0]
+      
+  # Mémoire et performance
+  memory:
+    checkpoint_activation: true
+    gradient_checkpointing: true
+    use_mixed_precision: true
+    empty_cache_frequency: 10
+    
+  # Analyse latente
+  latent_analysis:
+    normalization: "l2"
+    dimension_reduction: "pca"  # pca, umap, tsne
+    n_components: 50
+    compute_statistics: true
