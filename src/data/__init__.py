@@ -4,9 +4,7 @@ Fournit les outils de chargement, prétraitement et augmentation des vidéos.
 """
 
 from .dataset import (
-    VideoFaceDataset,
-    ContinualVideoDataset,
-    VJEPADataset
+    FaceDataset,
 )
 
 from .preprocessing import (
@@ -37,9 +35,9 @@ from .augmentation import (
 
 __all__ = [
     # Datasets
-    'VideoFaceDataset',
-    'ContinualVideoDataset',
-    'VJEPADataset',
+    'FaceDataset',
+    #'ContinualVideoDataset',
+    #'VJEPADataset',
     
     # Prétraitement
     'VideoPreprocessor',
