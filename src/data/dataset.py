@@ -48,8 +48,10 @@ class FaceDataset(Dataset):
             img = self.transform(img)
         return img, self.labels[idx]
     
+    # === NOUVELLES MÉTHODES DE VISUALISATION ===
+    
     def show_sample(self, num_images=8, figsize=(15, 6)):
-        """Affiche un échantillon d'images du dataset"""
+        """Affiche un échantillon aléatoire d'images"""
         indices = torch.randperm(len(self))[:num_images]
         
         fig, axes = plt.subplots(1, num_images, figsize=figsize)
