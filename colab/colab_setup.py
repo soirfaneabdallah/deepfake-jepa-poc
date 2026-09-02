@@ -1,27 +1,24 @@
 import os
-import sys
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
-def run(cmd):
-    subprocess.run(cmd, shell=True, check=True)
-
-def main():
+def mount_drive():
     from google.colab import drive
     drive.mount('/content/drive')
-    
-    run("pip install -q kagglehub")
-    
+
+def download_dataset():
+    subprocess.run("pip install -q kagglehub", shell=True, check=True)
     import kagglehub
-    dataset_path = kagglehub.dataset_download("xhlulu/140k-real-and-fake-faces")
-    
+    return kagglehub.dataset_download("xhlulu/140k-real-and-fake-faces")
+
+def setup():
+    mount_drive()
+    dataset_path = download_dataset()
     os.environ['DATASET_PATH'] = dataset_path
     os.environ['MODEL_SAVE_PATH'] = '/content/drive/MyDrive/deepfake_models'
-    
     Path('/content/drive/MyDrive/deepfake_models').mkdir(parents=True, exist_ok=True)
-    Path('/content/deepfake-forensics-jepa/results/checkpoints').mkdir(parents=True, exist_ok=True)
-    
-    print(dataset_path)
+    Path('results/checkpoints').mkdir(parents=True, exist_ok=True)
+    return dataset_path
 
 if __name__ == "__main__":
-    main()
+    setup()
