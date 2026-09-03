@@ -1,12 +1,6 @@
 """
-Module de prétraitement des vidéos pour la détection de deepfakes.
+Module de prétraitement des vidéos et images pour la détection de deepfakes.
 Fournit des outils pour le nettoyage, l'alignement et la normalisation des visages.
-
-Ce module est crucial car la qualité du prétraitement impacte directement
-les performances de détection. Les visages doivent être :
-- Correctement détectés et alignés
-- Normalisés pour une cohérence des features
-- Augmentés pour la robustesse
 """
 
 import torch
@@ -19,6 +13,7 @@ from dataclasses import dataclass, field
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +47,6 @@ class VideoPreprocessor:
     ):
         self.config = config
         
-        # Initialisation des composants
         self.face_aligner = FaceAligner(
             margin=config.face_margin,
             align_eyes=config.align_eyes
@@ -67,7 +61,6 @@ class VideoPreprocessor:
             clahe_grid_size=config.clahe_grid_size
         )
         
-        # Filtres optionnels
         self.denoiser = Denoiser(strength=config.denoise_strength) if config.denoise else None
         self.sharpener = Sharpener(strength=config.sharpen_strength) if config.sharpen else None
     
@@ -77,24 +70,12 @@ class VideoPreprocessor:
         face_detector: Optional[object] = None,
         landmarks: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        Prétraite un clip vidéo de visages.
-        
-        Args:
-            frames: (C, T, H, W) - Clip vidéo
-            face_detector: Détecteur de visages optionnel
-            landmarks: Landmarks faciaux optionnels
-            
-        Returns:
-            processed: (C, T, H', W') - Clip prétraité
-        """
-        # Vérification des dimensions
+        """Prétraite un clip vidéo de visages."""
         if frames.dim() != 4:
             raise ValueError(f"Expected 4D tensor (C, T, H, W), got {frames.dim()}D")
         
         C, T, H, W = frames.shape
         
-        # Étape 1 : Détection et extraction des visages
         if face_detector is not None:
             frames = face_detector.extract_faces(
                 frames,
@@ -102,11 +83,9 @@ class VideoPreprocessor:
                 align=self.config.align_eyes
             )
         
-        # Étape 2 : Alignement des visages
         if landmarks is not None:
             frames = self.face_aligner.align_frames(frames, landmarks)
         
-        # Étape 3 : Redimensionnement
         if frames.shape[-2:] != self.config.image_size:
             frames = F.interpolate(
                 frames,
@@ -115,15 +94,12 @@ class VideoPreprocessor:
                 align_corners=False
             )
         
-        # Étape 4 : Débruitage optionnel
         if self.denoiser is not None:
             frames = self.denoiser(frames)
         
-        # Étape 5 : Netteté optionnelle
         if self.sharpener is not None:
             frames = self.sharpener(frames)
         
-        # Étape 6 : Normalisation
         frames = self.frame_normalizer(frames)
         
         return frames
@@ -133,16 +109,7 @@ class VideoPreprocessor:
         batch: Dict[str, torch.Tensor],
         face_detector: Optional[object] = None
     ) -> Dict[str, torch.Tensor]:
-        """
-        Prétraite un batch complet.
-        
-        Args:
-            batch: Dictionnaire contenant les frames
-            face_detector: Détecteur de visages
-            
-        Returns:
-            processed_batch: Batch prétraité
-        """
+        """Prétraite un batch complet."""
         processed_batch = {}
         
         for key, frames in batch.items():
@@ -153,11 +120,68 @@ class VideoPreprocessor:
         
         return processed_batch
 
+    def preprocess_image(
+        self,
+        image: Union[torch.Tensor, np.ndarray, Image.Image, str],
+        face_detector: Optional[object] = None,
+        landmarks: Optional[np.ndarray] = None
+    ) -> torch.Tensor:
+        """
+        Prétraite une image unique.
+        
+        Args:
+            image: Image en entrée (tensor, numpy, PIL ou chemin)
+            face_detector: Détecteur de visages
+            landmarks: Landmarks faciaux
+            
+        Returns:
+            processed: (C, H, W) - Image prétraitée
+        """
+        # Chargement de l'image
+        if isinstance(image, str):
+            image = Image.open(image).convert('RGB')
+        
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        
+        if isinstance(image, np.ndarray):
+            if image.dtype != np.float32:
+                image = image.astype(np.float32) / 255.0
+            image = torch.from_numpy(image).permute(2, 0, 1)
+        
+        if image.dim() == 3:
+            image = image.unsqueeze(1)  # (C, 1, H, W)
+        
+        # Prétraitement
+        processed = self.preprocess(image, face_detector, landmarks)
+        
+        return processed.squeeze(1)  # (C, H, W)
+    
+    def preprocess_images(
+        self,
+        images: List[Union[torch.Tensor, np.ndarray, Image.Image, str]],
+        face_detector: Optional[object] = None
+    ) -> torch.Tensor:
+        """
+        Prétraite une liste d'images.
+        
+        Args:
+            images: Liste d'images
+            face_detector: Détecteur de visages
+            
+        Returns:
+            processed: (N, C, H, W) - Images prétraitées
+        """
+        processed_list = []
+        
+        for img in images:
+            processed = self.preprocess_image(img, face_detector)
+            processed_list.append(processed)
+        
+        return torch.stack(processed_list)
+
 class FaceAligner:
-    """
-    Alignement des visages basé sur les landmarks.
-    Aligne les yeux horizontalement et centre le visage.
-    """
+    """Alignement des visages basé sur les landmarks."""
     
     def __init__(
         self,
@@ -169,13 +193,12 @@ class FaceAligner:
         self.align_eyes = align_eyes
         self.target_eye_distance = target_eye_distance
         
-        # Points de référence pour l'alignement
         self.reference_points = np.array([
-            [30.2946, 51.6963],  # Œil gauche
-            [65.5318, 51.5014],  # Œil droit
-            [48.0252, 71.7366],  # Nez
-            [33.5493, 92.3655],  # Bouche gauche
-            [62.7299, 92.2041]   # Bouche droite
+            [30.2946, 51.6963],
+            [65.5318, 51.5014],
+            [48.0252, 71.7366],
+            [33.5493, 92.3655],
+            [62.7299, 92.2041]
         ], dtype=np.float32)
     
     def align_face(
@@ -183,34 +206,20 @@ class FaceAligner:
         face: np.ndarray,
         landmarks: np.ndarray
     ) -> np.ndarray:
-        """
-        Aligne un seul visage.
-        
-        Args:
-            face: (H, W, C) - Image du visage
-            landmarks: (5, 2) ou (68, 2) - Landmarks faciaux
-            
-        Returns:
-            aligned: (H, W, C) - Visage aligné
-        """
+        """Aligne un seul visage."""
         if landmarks is None or len(landmarks) < 5:
             return face
         
-        # Extraction des points clés (yeux, nez, bouche)
         if len(landmarks) == 68:
-            # Format 68 points
             key_points = landmarks[[36, 45, 30, 48, 54]]
         else:
-            # Format 5 points
             key_points = landmarks[:5]
         
-        # Calcul de la transformation affine
         transform_matrix = self._compute_transform_matrix(
             key_points.astype(np.float32),
             self.reference_points
         )
         
-        # Application de la transformation
         aligned = cv2.warpAffine(
             face,
             transform_matrix,
@@ -225,23 +234,12 @@ class FaceAligner:
         frames: torch.Tensor,
         landmarks: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Aligne un clip vidéo complet.
-        
-        Args:
-            frames: (C, T, H, W) - Clip vidéo
-            landmarks: (T, 5, 2) ou (T, 68, 2) - Landmarks par frame
-            
-        Returns:
-            aligned_frames: (C, T, H, W) - Clip aligné
-        """
+        """Aligne un clip vidéo complet."""
         C, T, H, W = frames.shape
         
-        # Conversion en numpy
-        frames_np = frames.permute(1, 2, 3, 0).numpy()  # (T, H, W, C)
+        frames_np = frames.permute(1, 2, 3, 0).numpy()
         frames_np = (frames_np * 255).astype(np.uint8)
         
-        # Alignement de chaque frame
         aligned_frames = []
         for t in range(T):
             if landmarks is not None and t < len(landmarks):
@@ -250,26 +248,60 @@ class FaceAligner:
                 aligned = frames_np[t]
             aligned_frames.append(aligned)
         
-        # Conversion en tensor
-        aligned_frames = np.stack(aligned_frames)  # (T, H, W, C)
+        aligned_frames = np.stack(aligned_frames)
         aligned_frames = torch.from_numpy(aligned_frames).permute(3, 0, 1, 2).float() / 255.0
         
         return aligned_frames
+    
+    def align_image(
+        self,
+        image: np.ndarray,
+        landmarks: np.ndarray
+    ) -> np.ndarray:
+        """
+        Aligne une image unique.
+        
+        Args:
+            image: (H, W, C) - Image
+            landmarks: (5, 2) ou (68, 2) - Landmarks faciaux
+            
+        Returns:
+            aligned: (H, W, C) - Image alignée
+        """
+        return self.align_face(image, landmarks)
+    
+    def align_batch(
+        self,
+        images: np.ndarray,
+        landmarks: np.ndarray
+    ) -> np.ndarray:
+        """
+        Aligne un batch d'images.
+        
+        Args:
+            images: (N, H, W, C) - Batch d'images
+            landmarks: (N, 5, 2) ou (N, 68, 2) - Landmarks par image
+            
+        Returns:
+            aligned: (N, H, W, C) - Images alignées
+        """
+        aligned_images = []
+        for i in range(len(images)):
+            aligned = self.align_face(images[i], landmarks[i] if landmarks is not None else None)
+            aligned_images.append(aligned)
+        
+        return np.stack(aligned_images)
     
     def _compute_transform_matrix(
         self,
         src_points: np.ndarray,
         dst_points: np.ndarray
     ) -> np.ndarray:
-        """
-        Calcule la matrice de transformation affine.
-        """
+        """Calcule la matrice de transformation affine."""
         if self.align_eyes:
-            # Alignement basé sur les yeux uniquement
             src_eyes = src_points[:2]
             dst_eyes = dst_points[:2]
             
-            # Calcul de l'angle de rotation
             src_angle = np.arctan2(
                 src_eyes[1, 1] - src_eyes[0, 1],
                 src_eyes[1, 0] - src_eyes[0, 0]
@@ -281,27 +313,22 @@ class FaceAligner:
             
             angle = np.degrees(dst_angle - src_angle)
             
-            # Calcul de l'échelle
             src_dist = np.linalg.norm(src_eyes[1] - src_eyes[0])
             dst_dist = np.linalg.norm(dst_eyes[1] - dst_eyes[0])
             scale = dst_dist / src_dist if src_dist > 0 else 1.0
             
-            # Centre des yeux
             src_center = src_eyes.mean(axis=0)
             dst_center = dst_eyes.mean(axis=0)
             
-            # Matrice de transformation
             transform = cv2.getRotationMatrix2D(
                 tuple(src_center),
                 angle,
                 scale
             )
             
-            # Translation
             transform[0, 2] += dst_center[0] - src_center[0]
             transform[1, 2] += dst_center[1] - src_center[1]
         else:
-            # Alignement basé sur tous les points (similarité)
             transform = cv2.estimateAffinePartial2D(
                 src_points,
                 dst_points
@@ -310,10 +337,7 @@ class FaceAligner:
         return transform
 
 class FrameNormalizer:
-    """
-    Normalisation des frames pour la cohérence des features.
-    Applique la normalisation par lots et l'égalisation d'histogramme.
-    """
+    """Normalisation des frames pour la cohérence des features."""
     
     def __init__(
         self,
@@ -329,7 +353,6 @@ class FrameNormalizer:
         self.normalize_illumination = normalize_illumination
         self.use_clahe = use_clahe
         
-        # CLAHE pour l'égalisation d'histogramme
         self.clahe = None
         if use_clahe:
             self.clahe = cv2.createCLAHE(
@@ -338,103 +361,123 @@ class FrameNormalizer:
             )
     
     def __call__(self, frames: torch.Tensor) -> torch.Tensor:
-        """
-        Normalise un clip vidéo.
-        
-        Args:
-            frames: (C, T, H, W) - Clip vidéo
-            
-        Returns:
-            normalized: (C, T, H, W) - Clip normalisé
-        """
-        # Étape 1 : Égalisation d'histogramme (CLAHE)
+        """Normalise un clip vidéo."""
         if self.use_clahe and self.clahe is not None:
             frames = self._apply_clahe(frames)
         
-        # Étape 2 : Normalisation par batch
         frames = self._normalize_batch(frames)
         
-        # Étape 3 : Normalisation standard
         frames = (frames - self.mean.to(frames.device)) / self.std.to(frames.device)
         
         return frames
     
+    def normalize_image(
+        self,
+        image: Union[torch.Tensor, np.ndarray]
+    ) -> torch.Tensor:
+        """
+        Normalise une image unique.
+        
+        Args:
+            image: (H, W, C) ou (C, H, W) - Image
+            
+        Returns:
+            normalized: (C, H, W) - Image normalisée
+        """
+        if isinstance(image, np.ndarray):
+            if image.dtype != np.float32:
+                image = image.astype(np.float32) / 255.0
+            if image.shape[2] == 3:  # (H, W, C)
+                image = torch.from_numpy(image).permute(2, 0, 1)
+            else:
+                image = torch.from_numpy(image)
+        
+        if image.dim() == 3:
+            image = image.unsqueeze(1)  # (C, 1, H, W)
+        
+        normalized = self(image)
+        
+        return normalized.squeeze(1)  # (C, H, W)
+    
+    def denormalize(
+        self,
+        frames: torch.Tensor,
+        clamp: bool = True
+    ) -> torch.Tensor:
+        """
+        Dénormalise un clip vidéo.
+        
+        Args:
+            frames: (C, T, H, W) - Clip normalisé
+            clamp: Clamper les valeurs entre 0 et 1
+            
+        Returns:
+            denormalized: (C, T, H, W) - Clip dénormalisé
+        """
+        denormalized = frames * self.std.to(frames.device) + self.mean.to(frames.device)
+        
+        if clamp:
+            denormalized = torch.clamp(denormalized, 0, 1)
+        
+        return denormalized
+    
     def _apply_clahe(self, frames: torch.Tensor) -> torch.Tensor:
-        """
-        Applique CLAHE pour améliorer le contraste local.
-        """
+        """Applique CLAHE pour améliorer le contraste local."""
         C, T, H, W = frames.shape
         
-        # Conversion en numpy
-        frames_np = frames.permute(1, 2, 3, 0).numpy()  # (T, H, W, C)
+        frames_np = frames.permute(1, 2, 3, 0).numpy()
         frames_np = (frames_np * 255).astype(np.uint8)
         
-        # Application de CLAHE sur le canal de luminance
         processed = []
         for t in range(T):
             frame = frames_np[t]
             
-            # Conversion en LAB
             lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB)
             l_channel, a_channel, b_channel = cv2.split(lab)
             
-            # Application de CLAHE sur le canal L
             l_channel = self.clahe.apply(l_channel)
             
-            # Fusion des canaux
             lab = cv2.merge([l_channel, a_channel, b_channel])
             frame = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
             
             processed.append(frame)
         
-        # Conversion en tensor
-        processed = np.stack(processed)  # (T, H, W, C)
+        processed = np.stack(processed)
         processed = torch.from_numpy(processed).permute(3, 0, 1, 2).float() / 255.0
         
         return processed
     
     def _normalize_batch(self, frames: torch.Tensor) -> torch.Tensor:
-        """
-        Normalise chaque frame individuellement.
-        """
+        """Normalise chaque frame individuellement."""
         if not self.normalize_illumination:
             return frames
         
-        # Calcul des statistiques par frame
         mean = frames.mean(dim=(2, 3), keepdim=True)
         std = frames.std(dim=(2, 3), keepdim=True) + 1e-8
         
-        # Normalisation
         normalized = (frames - mean) / std
         
-        # Mélange avec l'original pour éviter la sur-normalisation
         alpha = 0.7
         return alpha * normalized + (1 - alpha) * frames
 
 class Denoiser:
-    """
-    Débruitage des frames pour réduire le bruit de capteur.
-    """
+    """Débruitage des frames pour réduire le bruit de capteur."""
     
     def __init__(
         self,
         strength: int = 10,
-        method: str = 'fastnlmeans'  # fastnlmeans, bilateral, gaussian
+        method: str = 'fastnlmeans'
     ):
         self.strength = strength
         self.method = method
     
     def __call__(self, frames: torch.Tensor) -> torch.Tensor:
-        """
-        Débruite un clip vidéo.
-        """
+        """Débruite un clip vidéo."""
         C, T, H, W = frames.shape
         
-        # Conversion en numpy
         frames_np = frames.permute(1, 2, 3, 0).numpy()
         frames_np = (frames_np * 255).astype(np.uint8)
         
-        # Débruitage de chaque frame
         denoised = []
         for t in range(T):
             frame = frames_np[t]
@@ -455,7 +498,7 @@ class Denoiser:
                     self.strength,
                     self.strength
                 )
-            else:  # gaussian
+            else:
                 frame = cv2.GaussianBlur(
                     frame,
                     (5, 5),
@@ -464,42 +507,67 @@ class Denoiser:
             
             denoised.append(frame)
         
-        # Conversion en tensor
         denoised = np.stack(denoised)
         denoised = torch.from_numpy(denoised).permute(3, 0, 1, 2).float() / 255.0
         
         return denoised
+    
+    def denoise_image(self, image: np.ndarray) -> np.ndarray:
+        """
+        Débruite une image unique.
+        
+        Args:
+            image: (H, W, C) - Image
+            
+        Returns:
+            denoised: (H, W, C) - Image débruirée
+        """
+        if self.method == 'fastnlmeans':
+            return cv2.fastNlMeansDenoisingColored(
+                image,
+                None,
+                self.strength,
+                self.strength,
+                7,
+                21
+            )
+        elif self.method == 'bilateral':
+            return cv2.bilateralFilter(
+                image,
+                -1,
+                self.strength,
+                self.strength
+            )
+        else:
+            return cv2.GaussianBlur(
+                image,
+                (5, 5),
+                self.strength / 10
+            )
 
 class Sharpener:
-    """
-    Amélioration de la netteté des frames.
-    """
+    """Amélioration de la netteté des frames."""
     
     def __init__(
         self,
         strength: float = 1.0,
-        method: str = 'unsharp'  # unsharp, laplacian
+        method: str = 'unsharp'
     ):
         self.strength = strength
         self.method = method
     
     def __call__(self, frames: torch.Tensor) -> torch.Tensor:
-        """
-        Améliore la netteté d'un clip vidéo.
-        """
+        """Améliore la netteté d'un clip vidéo."""
         C, T, H, W = frames.shape
         
-        # Conversion en numpy
         frames_np = frames.permute(1, 2, 3, 0).numpy()
         frames_np = (frames_np * 255).astype(np.uint8)
         
-        # Application de la netteté
         sharpened = []
         for t in range(T):
             frame = frames_np[t]
             
             if self.method == 'unsharp':
-                # Masque flou
                 blurred = cv2.GaussianBlur(frame, (0, 0), 3)
                 frame = cv2.addWeighted(
                     frame,
@@ -508,8 +576,7 @@ class Sharpener:
                     -self.strength,
                     0
                 )
-            else:  # laplacian
-                # Filtre laplacien
+            else:
                 laplacian = cv2.Laplacian(frame, cv2.CV_64F)
                 frame = cv2.addWeighted(
                     frame,
@@ -521,54 +588,66 @@ class Sharpener:
             
             sharpened.append(frame)
         
-        # Conversion en tensor
         sharpened = np.stack(sharpened)
         sharpened = torch.from_numpy(sharpened).permute(3, 0, 1, 2).float() / 255.0
         
         return sharpened
+    
+    def sharpen_image(self, image: np.ndarray) -> np.ndarray:
+        """
+        Améliore la netteté d'une image unique.
+        
+        Args:
+            image: (H, W, C) - Image
+            
+        Returns:
+            sharpened: (H, W, C) - Image affinée
+        """
+        if self.method == 'unsharp':
+            blurred = cv2.GaussianBlur(image, (0, 0), 3)
+            return cv2.addWeighted(
+                image,
+                1 + self.strength,
+                blurred,
+                -self.strength,
+                0
+            )
+        else:
+            laplacian = cv2.Laplacian(image, cv2.CV_64F)
+            return cv2.addWeighted(
+                image,
+                1,
+                laplacian.astype(np.uint8),
+                -self.strength,
+                0
+            )
 
 class TemporalSmoother:
-    """
-    Lissage temporel pour réduire les variations brusques.
-    Utile pour stabiliser les features entre frames consécutives.
-    """
+    """Lissage temporel pour réduire les variations brusques."""
     
     def __init__(
         self,
         window_size: int = 5,
-        method: str = 'moving_average'  # moving_average, exponential, median
+        method: str = 'moving_average'
     ):
         self.window_size = window_size
         self.method = method
     
     def __call__(self, frames: torch.Tensor) -> torch.Tensor:
-        """
-        Lisse un clip vidéo temporellement.
-        
-        Args:
-            frames: (C, T, H, W)
-            
-        Returns:
-            smoothed: (C, T, H, W)
-        """
+        """Lisse un clip vidéo temporellement."""
         if self.method == 'moving_average':
             return self._moving_average(frames)
         elif self.method == 'exponential':
             return self._exponential_smoothing(frames)
-        else:  # median
+        else:
             return self._median_filter(frames)
     
     def _moving_average(self, frames: torch.Tensor) -> torch.Tensor:
-        """
-        Lissage par moyenne mobile.
-        """
         C, T, H, W = frames.shape
         
-        # Padding temporel
         pad_size = self.window_size // 2
         padded = F.pad(frames, (0, 0, 0, 0, pad_size, pad_size), mode='replicate')
         
-        # Application de la moyenne mobile
         smoothed = []
         for t in range(T):
             window = padded[:, t:t+self.window_size]
@@ -577,9 +656,6 @@ class TemporalSmoother:
         return torch.cat(smoothed, dim=1)
     
     def _exponential_smoothing(self, frames: torch.Tensor) -> torch.Tensor:
-        """
-        Lissage exponentiel.
-        """
         alpha = 0.3
         smoothed = [frames[:, 0:1]]
         
@@ -591,16 +667,11 @@ class TemporalSmoother:
         return torch.cat(smoothed, dim=1)
     
     def _median_filter(self, frames: torch.Tensor) -> torch.Tensor:
-        """
-        Filtre médian temporel.
-        """
         C, T, H, W = frames.shape
         
-        # Padding temporel
         pad_size = self.window_size // 2
         padded = F.pad(frames, (0, 0, 0, 0, pad_size, pad_size), mode='replicate')
         
-        # Application du filtre médian
         smoothed = []
         for t in range(T):
             window = padded[:, t:t+self.window_size]
@@ -609,10 +680,7 @@ class TemporalSmoother:
         return torch.cat(smoothed, dim=1)
 
 class VideoPreprocessorPipeline:
-    """
-    Pipeline complet de prétraitement vidéo.
-    Enchaîne toutes les étapes de manière cohérente.
-    """
+    """Pipeline complet de prétraitement vidéo."""
     
     def __init__(
         self,
@@ -620,11 +688,7 @@ class VideoPreprocessorPipeline:
         use_temporal_smoothing: bool = False
     ):
         self.config = config
-        
-        # Initialisation des composants
         self.preprocessor = VideoPreprocessor(config)
-        
-        # Lissage temporel optionnel
         self.temporal_smoother = TemporalSmoother(
             window_size=5,
             method='moving_average'
@@ -636,38 +700,60 @@ class VideoPreprocessorPipeline:
         face_detector: Optional[object] = None,
         landmarks: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        Applique le pipeline complet de prétraitement.
-        
-        Args:
-            frames: (C, T, H, W) - Clip vidéo brut
-            face_detector: Détecteur de visages
-            landmarks: Landmarks faciaux
-            
-        Returns:
-            processed: (C, T, H', W') - Clip prétraité
-        """
-        # Prétraitement de base
+        """Applique le pipeline complet de prétraitement."""
         processed = self.preprocessor.preprocess(
             frames,
             face_detector,
             landmarks
         )
         
-        # Lissage temporel optionnel
         if self.temporal_smoother is not None:
             processed = self.temporal_smoother(processed)
         
         return processed
+    
+    def preprocess_image(
+        self,
+        image: Union[torch.Tensor, np.ndarray, Image.Image, str],
+        face_detector: Optional[object] = None,
+        landmarks: Optional[np.ndarray] = None
+    ) -> torch.Tensor:
+        """
+        Prétraite une image unique.
+        
+        Args:
+            image: Image en entrée
+            face_detector: Détecteur de visages
+            landmarks: Landmarks faciaux
+            
+        Returns:
+            processed: (C, H, W) - Image prétraitée
+        """
+        return self.preprocessor.preprocess_image(image, face_detector, landmarks)
+    
+    def preprocess_images(
+        self,
+        images: List[Union[torch.Tensor, np.ndarray, Image.Image, str]],
+        face_detector: Optional[object] = None
+    ) -> torch.Tensor:
+        """
+        Prétraite une liste d'images.
+        
+        Args:
+            images: Liste d'images
+            face_detector: Détecteur de visages
+            
+        Returns:
+            processed: (N, C, H, W) - Images prétraitées
+        """
+        return self.preprocessor.preprocess_images(images, face_detector)
     
     def preprocess_batch(
         self,
         batch: Dict[str, torch.Tensor],
         face_detector: Optional[object] = None
     ) -> Dict[str, torch.Tensor]:
-        """
-        Prétraite un batch complet.
-        """
+        """Prétraite un batch complet."""
         processed_batch = {}
         
         for key, value in batch.items():
@@ -688,20 +774,7 @@ def create_preprocessor(
     use_temporal_smoothing: bool = False,
     **kwargs
 ) -> VideoPreprocessorPipeline:
-    """
-    Factory pour créer un pipeline de prétraitement.
-    
-    Args:
-        image_size: Taille des images
-        use_clahe: Utiliser CLAHE
-        normalize_illumination: Normaliser l'illumination
-        denoise: Débruiter
-        sharpen: Améliorer la netteté
-        use_temporal_smoothing: Lissage temporel
-        
-    Returns:
-        pipeline: Pipeline de prétraitement configuré
-    """
+    """Factory pour créer un pipeline de prétraitement."""
     config = PreprocessingConfig(
         image_size=image_size,
         use_clahe=use_clahe,
@@ -715,3 +788,20 @@ def create_preprocessor(
         config=config,
         use_temporal_smoothing=use_temporal_smoothing
     )
+
+def preprocess_image_simple(
+    image: Union[torch.Tensor, np.ndarray, Image.Image, str],
+    image_size: Tuple[int, int] = (224, 224)
+) -> torch.Tensor:
+    """
+    Fonction simple pour prétraiter une image rapidement.
+    
+    Args:
+        image: Image en entrée
+        image_size: Taille de sortie
+        
+    Returns:
+        processed: (C, H, W) - Image prétraitée
+    """
+    preprocessor = create_preprocessor(image_size=image_size)
+    return preprocessor.preprocess_image(image)
