@@ -1,5 +1,5 @@
 """
-Module d'entraînement v-JEPA avec gestion complète des données
+Module d'entraînement v-JEPA corrigé
 """
 
 import torch
@@ -7,17 +7,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split, Dataset
-from torch.cuda.amp import autocast, GradScaler
 import numpy as np
-import logging
 from typing import Dict, Optional, Tuple, List, Union
 from dataclasses import dataclass
 from tqdm import tqdm
 from pathlib import Path
 import torchvision.transforms as T
 from PIL import Image
-
-logger = logging.getLogger(__name__)
+import subprocess
+import sys
+import importlib
 
 # === CONFIGURATIONS ===
 
@@ -47,19 +46,16 @@ class JEPATrainingConfig(TrainingConfig):
     temperature: float = 0.1
     use_vicreg: bool = False
     num_augmentations: int = 2
-    num_frames: int = 8  # Nombre de frames pour la vidéo
+    num_frames: int = 8
 
 
 # === WRAPPER POUR CONVERTIR IMAGES EN VIDEOS ===
 
 class VideoDatasetWrapper(Dataset):
-    """Wrapper qui convertit des images en vidéos pour v-JEPA."""
-    
     def __init__(self, dataset, num_frames=8, transform=None):
         self.dataset = dataset
         self.num_frames = num_frames
         
-        # Transformation par défaut si non fournie
         if transform is None:
             self.transform = T.Compose([
                 T.Resize((224, 224)),
@@ -68,18 +64,11 @@ class VideoDatasetWrapper(Dataset):
             ])
         else:
             self.transform = transform
-        
-        # Appliquer la transformation au dataset
-        if hasattr(dataset, 'transform'):
-            # Sauvegarder l'ancienne transformation
-            self.original_transform = dataset.transform
-            dataset.transform = None  # On applique nous-mêmes
     
     def __len__(self):
         return len(self.dataset)
     
     def __getitem__(self, idx):
-        # Récupérer l'image et le label
         item = self.dataset[idx]
         
         if isinstance(item, tuple) and len(item) == 2:
@@ -88,7 +77,6 @@ class VideoDatasetWrapper(Dataset):
             img = item
             label = 0
         
-        # Appliquer la transformation
         if isinstance(img, Image.Image):
             img_tensor = self.transform(img)
         elif isinstance(img, torch.Tensor):
@@ -96,8 +84,6 @@ class VideoDatasetWrapper(Dataset):
         else:
             img_tensor = self.transform(Image.fromarray(img))
         
-        # Convertir en vidéo: répéter la frame T fois
-        # (C, H, W) -> (C, T, H, W) avec T = num_frames
         video = img_tensor.unsqueeze(1).repeat(1, self.num_frames, 1, 1)
         
         return video, label
@@ -145,14 +131,17 @@ class BaseTrainer:
         device: str = 'cuda',
         checkpoint_dir: str = './checkpoints'
     ):
-        self.model = model
         self.config = config
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        
+        # Déplacer le modèle sur le device
+        self.model = model.to(self.device)
+        
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         self.optimizer = optim.AdamW(
-            model.parameters(),
+            self.model.parameters(),
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
             betas=(0.9, 0.95)
@@ -164,11 +153,7 @@ class BaseTrainer:
             eta_min=1e-6
         )
         
-        # GradScaler avec la nouvelle API
-        if config.mixed_precision and torch.cuda.is_available():
-            self.scaler = torch.amp.GradScaler('cuda')
-        else:
-            self.scaler = None
+        self.scaler = torch.amp.GradScaler('cuda') if (config.mixed_precision and torch.cuda.is_available()) else None
         
         self.early_stopping = EarlyStopping(patience=config.early_stopping_patience)
         self.train_losses = []
@@ -246,13 +231,8 @@ class JEPALossCalculator:
     def __init__(self, config: JEPATrainingConfig):
         self.config = config
     
-    def compute_loss(
-        self,
-        context_pred: torch.Tensor,
-        target_features: torch.Tensor,
-        context_mask: Optional[torch.Tensor] = None,
-        target_mask: Optional[torch.Tensor] = None
-    ) -> Dict[str, torch.Tensor]:
+    def compute_loss(self, context_pred: torch.Tensor, target_features: torch.Tensor,
+                     context_mask=None, target_mask=None) -> Dict[str, torch.Tensor]:
         losses = {}
         
         if self.config.loss_type == 'smooth_l1':
@@ -284,13 +264,8 @@ class JEPALossCalculator:
 # === JEPA TRAINER ===
 
 class JEPATrainer(BaseTrainer):
-    def __init__(
-        self,
-        model: nn.Module,
-        config: JEPATrainingConfig,
-        device: str = 'cuda',
-        checkpoint_dir: str = './checkpoints/jepa'
-    ):
+    def __init__(self, model: nn.Module, config: JEPATrainingConfig,
+                 device: str = 'cuda', checkpoint_dir: str = './checkpoints/jepa'):
         super().__init__(model, config, device, checkpoint_dir)
         self.jepa_config = config
         self.loss_calculator = JEPALossCalculator(config)
@@ -303,7 +278,6 @@ class JEPATrainer(BaseTrainer):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         
         for batch_idx, batch in enumerate(pbar):
-            # Récupérer les données
             if isinstance(batch, dict):
                 videos = batch.get('frames', batch.get('video'))
                 labels = batch.get('label', None)
@@ -313,27 +287,22 @@ class JEPATrainer(BaseTrainer):
                 videos = batch
                 labels = None
             
-            videos = videos.to(self.device)  # (B, C, T, H, W)
+            videos = videos.to(self.device)
             
-            # Créer contexte et cible (split temporel)
             T = videos.size(2)
             split = T // 2
             x_context = videos[:, :, :split]
             x_target = videos[:, :, split:]
             
-            # Si les dimensions ne correspondent pas, ajuster
             if x_context.size(2) < self.jepa_config.num_frames:
                 pad = self.jepa_config.num_frames - x_context.size(2)
                 x_context = F.pad(x_context, (0, 0, 0, 0, 0, pad))
                 x_target = F.pad(x_target, (0, 0, 0, 0, 0, pad))
             
-            # Générer les masques
             context_mask, target_mask = self.model.generate_mask(
-                x_context.size(0),
-                self.device
+                x_context.size(0), self.device
             )
             
-            # Forward pass avec autocast (nouvelle API)
             if self.scaler is not None:
                 with torch.amp.autocast('cuda'):
                     context_pred, target_features = self.model(
@@ -409,8 +378,7 @@ class JEPATrainer(BaseTrainer):
                     x_target = F.pad(x_target, (0, 0, 0, 0, 0, pad))
                 
                 context_mask, target_mask = self.model.generate_mask(
-                    x_context.size(0),
-                    self.device
+                    x_context.size(0), self.device
                 )
                 
                 context_pred, target_features = self.model(
@@ -435,8 +403,6 @@ def train_vjepa(
     device: str = 'cuda',
     checkpoint_dir: str = './checkpoints/vjepa'
 ):
-    """Fonction principale d'entraînement v-JEPA."""
-    
     from src.models.vjepa import VJEPAModel, VJEPAConfig
     
     if config is None:
@@ -448,7 +414,6 @@ def train_vjepa(
             num_frames=8
         )
     
-    # Configuration du modèle
     model_config = VJEPAConfig(
         input_size=(224, 224),
         num_frames=config.num_frames,
@@ -461,10 +426,9 @@ def train_vjepa(
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     
-    # === TOUT LE TRAITEMENT DES DONNÉES ICI ===
+    # Préparer les données
     print("\nPreparing data...")
     
-    # 1. Ajouter la transformation au dataset si nécessaire
     transform = T.Compose([
         T.Resize((224, 224)),
         T.ToTensor(),
@@ -473,9 +437,7 @@ def train_vjepa(
     
     if not hasattr(dataset, 'transform') or dataset.transform is None:
         dataset.transform = transform
-        print("Added transforms to dataset")
     
-    # 2. Wrapper pour convertir les images en vidéos
     video_dataset = VideoDatasetWrapper(
         dataset,
         num_frames=config.num_frames,
@@ -483,9 +445,7 @@ def train_vjepa(
     )
     
     print(f"Dataset size: {len(video_dataset)}")
-    print(f"Video shape: (C, T, H, W) avec T={config.num_frames}")
     
-    # 3. Split
     train_size = int(0.8 * len(video_dataset))
     val_size = len(video_dataset) - train_size
     train_ds, val_ds = random_split(video_dataset, [train_size, val_size])
@@ -493,7 +453,6 @@ def train_vjepa(
     print(f"Train: {len(train_ds)} images")
     print(f"Val: {len(val_ds)} images")
     
-    # 4. DataLoaders avec num_workers=0 pour éviter les problèmes
     train_loader = DataLoader(
         train_ds,
         batch_size=config.batch_size,
@@ -509,17 +468,19 @@ def train_vjepa(
         pin_memory=True
     )
     
-    # 5. Vérifier une batch
+    # Vérifier une batch
     for videos, labels in train_loader:
-        print(f"Batch video shape: {videos.shape}")  # (B, C, T, H, W)
+        print(f"Batch video shape: {videos.shape}")
         print(f"Batch labels: {labels.shape}")
         break
     
-    # 6. Créer le modèle
+    # Créer le modèle et le déplacer sur le device
     model = VJEPAModel(model_config)
+    model = model.to(device)  # CRUCIAL: déplacer le modèle sur GPU
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Model device: {next(model.parameters()).device}")
     
-    # 7. Trainer
+    # Trainer
     trainer = JEPATrainer(
         model=model,
         config=config,
@@ -527,7 +488,7 @@ def train_vjepa(
         checkpoint_dir=checkpoint_dir
     )
     
-    # 8. Entraînement
+    # Entraînement
     trainer.train(train_loader, val_loader)
     
     return trainer
