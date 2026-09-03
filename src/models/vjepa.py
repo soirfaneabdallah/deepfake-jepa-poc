@@ -12,6 +12,11 @@ import torch.nn.functional as F
 import math
 from typing import Tuple, Optional, List, Dict
 from dataclasses import dataclass
+import torch
+from pathlib import Path
+from typing import Optional, Union
+import urllib.request
+import json
 
 @dataclass
 class VJEPAConfig:
@@ -369,3 +374,74 @@ class VJEPAModel(nn.Module):
         score = torch.sqrt(diff @ reference_cov_inv @ diff.T)
         
         return score
+    
+
+
+class VJEPAPretrainedLoader:
+    """
+    Chargeur de modèles v-JEPA pré-entraînés.
+    Supporte : fichiers locaux, Hugging Face, URLs.
+    """
+    
+    # Modèles disponibles
+    MODELS = {
+        'vjepa_base': {
+            'url': 'https://dl.fbaipublicfiles.com/jepa/vjepa_base.pth',
+            'config': {'embed_dim': 384, 'depth': 6, 'num_heads': 6}
+        },
+        'vjepa_large': {
+            'url': 'https://dl.fbaipublicfiles.com/jepa/vjepa_large.pth',
+            'config': {'embed_dim': 768, 'depth': 12, 'num_heads': 12}
+        }
+    }
+    
+    @classmethod
+    def load(cls, 
+             source: Union[str, Path], 
+             device: str = 'cuda',
+             strict: bool = False) -> torch.nn.Module:
+        """
+        Charge un modèle v-JEPA.
+        
+        Args:
+            source: Chemin local, nom du modèle ('vjepa_base'), ou URL
+            device: 'cuda' ou 'cpu'
+            strict: Chargement strict des poids
+            
+        Returns:
+            VJEPAModel chargé
+        """
+        
+        device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        source = str(source)
+        
+        # Si c'est un nom de modèle prédéfini
+        if source in cls.MODELS:
+            config_dict = cls.MODELS[source]['config']
+            url = cls.MODELS[source]['url']
+            local_path = Path.home() / '.cache' / 'vjepa' / f'{source}.pth'
+            
+            if not local_path.exists():
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                urllib.request.urlretrieve(url, local_path)
+            
+            source = local_path
+        
+        # Config par défaut
+        config = VJEPAConfig()
+        model = VJEPAModel(config).to(device)
+        
+        # Chargement
+        if Path(source).exists():
+            checkpoint = torch.load(source, map_location=device)
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            
+            # Filtrer les clés incompatibles
+            model_state = model.state_dict()
+            filtered = {k: v for k, v in state_dict.items() 
+                       if k in model_state and v.shape == model_state[k].shape}
+            
+            model.load_state_dict(filtered, strict=strict)
+            print(f"[V-JEPA] Modèle chargé: {source} ({len(filtered)}/{len(model_state)} paramètres)")
+        
+        return model
